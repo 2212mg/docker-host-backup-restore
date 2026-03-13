@@ -79,7 +79,7 @@ mkdir -p "$HOST_DIR" "$LOG_DIR"
 TS=$(date +%F-%H-%M)
 LOG="$LOG_DIR/bklog_$TS.log"
 STOPPED_FILE="$HOST_DIR/stopped_containers_$TS.lst"
-SSH_OPTS="-i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+SSH_OPTS="-o StrictHostKeyChecking=no"
 
 # Ensure containers are restarted on exit (and remove the record file)
 restart_containers() {

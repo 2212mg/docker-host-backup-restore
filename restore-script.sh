@@ -82,7 +82,7 @@ mkdir -p "$HOST_DIR" "$LOG_DIR"
 TS=$(date +%F-%H-%M)
 LOG="$LOG_DIR/restore_$TS.log"
 STOPPED_FILE="$HOST_DIR/restore_stopped_${TS}.lst"
-SSH_OPTS="-i $HOME/.ssh/id_rsa -o StrictHostKeyChecking=no"
+SSH_OPTS="-o StrictHostKeyChecking=no"
 
 # On exit, restart containers and delete the record
 restart_containers() {
