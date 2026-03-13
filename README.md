@@ -208,7 +208,7 @@ backup-script.sh -x pihole backupuser remote.example.com /backups
 ### Back up Docker storage plus additional absolute paths
 
 ```bash
-backup-script.sh -x pihole backupuser remote.example.com /backups /etc /home/marco/portainer
+backup-script.sh -x pihole backupuser remote.example.com /backups /etc /home/myuser/portainer
 ```
 
 ### Dry-run without disrupting running containers
@@ -220,13 +220,13 @@ backup-script.sh -n -x pihole backupuser remote.example.com /backups /etc
 ### Back up Portainer compose files too
 
 ```bash
-backup-script.sh -P /home/marco/portainer/docker-compose.yml backupuser remote.example.com /backups
+backup-script.sh -P /home/myuser/portainer/docker-compose.yml backupuser remote.example.com /backups
 ```
 
 ### Dry-run with Portainer compose file discovery
 
 ```bash
-backup-script.sh -n -x pihole -P /home/marco/portainer/docker-compose.yml backupuser remote.example.com /backups
+backup-script.sh -n -x pihole -P /home/myuser/portainer/docker-compose.yml backupuser remote.example.com /backups
 ```
 
 ---
@@ -301,7 +301,7 @@ Only those absolute paths are restored, for example:
 ```bash
 /etc
 /var/lib/docker/volumes
-/home/marco/portainer
+/home/myuser/portainer
 ```
 
 Each requested path is checked against the selected backup set. Paths that do not exist in that backup are skipped.
@@ -343,13 +343,13 @@ restore-script.sh -t 2026-03-13-13-28 backupuser remote.example.com /backups /et
 ### Dry-run restore while keeping `pihole` running
 
 ```bash
-restore-script.sh -n -x pihole -t 2026-03-13-13-28 backupuser remote.example.com /backups /home/marco/portainer
+restore-script.sh -n -x pihole -t 2026-03-13-13-28 backupuser remote.example.com /backups /home/myuser/portainer
 ```
 
 ### Restore Portainer compose files too
 
 ```bash
-restore-script.sh -P /home/marco/portainer/docker-compose.yml -t 2026-03-13-13-28 backupuser remote.example.com /backups
+restore-script.sh -P /home/myuser/portainer/docker-compose.yml -t 2026-03-13-13-28 backupuser remote.example.com /backups
 ```
 
 ---
@@ -421,4 +421,4 @@ Older entries are removed automatically.
 
 ## Maintainer
 
-Maintained by **Marco Gehm**
+Maintained by **myuser Gehm**
