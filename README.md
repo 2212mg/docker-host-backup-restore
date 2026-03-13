@@ -31,7 +31,7 @@ This repository provides two Bash scripts for reliable, automated data protectio
    ```bash
    chmod +x backup-script.sh restore-script.sh
    ```
-3. Ensure the SSH identity (`~/.ssh/id_rsa`) and `authorized_keys` are set up for `$BACKUP_USER` on the target host.
+3. Ensure the SSH identity (`~/.ssh/`) and `authorized_keys` are set up for `$BACKUP_USER` on the target host.
 
 ---
 
@@ -137,7 +137,6 @@ restore-script.sh [OPTIONS] <backup_user> <target_host> <backup_root> [<path1> .
 
 ## Notes
 
-* Adjust `SSH_OPTS` in each script if you require different SSH key paths or host key checking behavior.
 * Ensure `sudo` on target host is password-less for the needed commands (`lvcreate`, `zfs`, `docker`, `rsync`).
 
 ---
