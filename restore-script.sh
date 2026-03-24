@@ -69,20 +69,20 @@ Behavior:
   - If restore paths are given, they must be absolute target paths such as:
       /etc
       /var/lib/docker/volumes
-      /home/marco/portainer
+      /home/user/portainer
   - If -P is supplied, the script also includes Portainer compose files discovered
     inside Portainer's data area in the selected backup set.
 
 Examples:
-  restore-script.sh backup_worker 192.168.0.229 ./backups
+  restore-script.sh backup-user [RESTORE-TARGET-IP] ./backups
 
-  restore-script.sh -t 2026-03-13-13-28 backup_worker 192.168.0.229 ./backups
+  restore-script.sh -t 2026-03-13-13-28 backup-user [RESTORE-TARGET-IP] ./backups
 
-  restore-script.sh -x pihole backup_worker 192.168.0.229 ./backups /etc /var/lib/docker/volumes
+  restore-script.sh -x pihole backup-user [RESTORE-TARGET-IP] ./backups /etc /var/lib/docker/volumes
 
-  restore-script.sh -n -t 2026-03-13-13-28 backup_worker 192.168.0.229 ./backups /home/marco/portainer
+  restore-script.sh -n -t 2026-03-13-13-28 backup-user [RESTORE-TARGET-IP] ./backups /home/user/portainer
 
-  restore-script.sh -P /home/marco/portainer/docker-compose.yml -t 2026-03-13-13-28 backup_worker 192.168.0.229 ./backups
+  restore-script.sh -P /path/to/docker-compose.yml -t 2026-03-13-13-28 backup-user [RESTORE-TARGET-IP] ./backups
 EOF
 }
 
