@@ -80,13 +80,13 @@ Description:
     - pruning old backups/logs/manifests/source lists (keeping the 4 most recent).
 
 Examples:
-  backup-script.sh backup_worker 192.168.0.229 ./backups
+  backup-script.sh backup-user [BACKUP-TARGET-IP] ./backups
 
-  backup-script.sh -x pihole backup_worker 192.168.0.229 ./backups
+  backup-script.sh -x pihole backup-user [BACKUP-TARGET-IP] ./backups
 
-  backup-script.sh -n -x pihole -P /home/marco/portainer/docker-compose.yml backup_worker 192.168.0.229 ./backups
+  backup-script.sh -n -x pihole -P /path/to/portainer/docker-compose.yml backup-user [BACKUP-TARGET-IP] ./backups
 
-  backup-script.sh -x pihole -P /home/marco/portainer/docker-compose.yml backup_worker 192.168.0.229 ./backups /etc
+  backup-script.sh -x pihole -P /path/to/portainer/docker-compose.yml backup-user [BACKUP-TARGET-IP] ./backups /etc
 
 Notes:
   - Additional CLI paths must be absolute paths on the target host.
