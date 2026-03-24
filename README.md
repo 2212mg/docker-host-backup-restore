@@ -416,9 +416,3 @@ Older entries are removed automatically.
 - Additional backup and restore paths should always be given as **absolute paths** to avoid ambiguity.
 - Portainer compose file discovery depends on the Portainer container having a `/data` mount that maps to a host path.
 - If you need fully consistent point-in-time backups, the target storage layout would need a real snapshot backend such as LVM, ZFS, Btrfs, or an external hypervisor/storage snapshot mechanism.
-
----
-
-## Maintainer
-
-Maintained by **myuser Gehm**
