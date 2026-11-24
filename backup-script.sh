@@ -1,639 +1,598 @@
 #!/usr/bin/env bash
 # backup-script.sh
-# Copyright 2026 Marco Gehm
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# -------------------------------------------------------------------
-# Usage:
-#   backup-script.sh [OPTIONS] <backup_user> <target_host> <backup_root> [<path1> [<path2> ...]]
-#
-# OPTIONS:
-#   -h               Show this help message and exit.
-#   -s               Deprecated/no-op (kept for backward compatibility).
-#   -x cont1,cont2   Comma-separated list of Docker container names to exclude from stop/restart.
-#                    Excluded containers are STILL inspected and their storage is STILL backed up live.
-#   -e exclude_file  File containing rsync exclude patterns.
-#   -n               Dry-run mode (true no-disruption mode: no container stop/start, rsync --dry-run).
-#   -b MBPS          Bandwidth limit in MB/s for rsync.
-#   -p streams       Number of parallel rsync streams. Accepted, but forced to 1 for safety.
-#   -P file          Absolute path to Portainer's own docker-compose.yml on the target host.
-#                    When set, the script also discovers additional compose files stored inside
-#                    Portainer's data area and backs them up with full absolute paths.
-#
-# DESCRIPTION:
-#   Live backup only.
-#
-#   1) Inspect running Docker containers on the remote host.
-#   2) Discover their persistent storage locations:
-#        - bind mounts
-#        - named/anonymous Docker volumes
-#      (Intentionally skips overlay2 writable layer paths)
-#   3) Optionally discover Portainer-managed compose files when -P is set.
-#   4) Stop all running containers except those excluded via -x.
-#      (Skipped completely in dry-run mode.)
-#   5) Back up all discovered storage paths, preserving absolute paths.
-#   6) Also back up any additional absolute paths supplied on the CLI.
-#   7) Restart previously stopped containers automatically.
-#   8) Prune old backups/logs (keep 4).
-#
-# REQUIREMENTS ON TARGET:
-#   backup_user must be able to run at least these without a password:
-#     sudo -n docker ...
-#     sudo -n rsync ...
-#     sudo -n test ...
-#     sudo -n find ...
-#
-# NOTES:
-#   - Excluded containers are NOT stopped, so their storage is backed up live and may be inconsistent.
-#   - tmpfs mounts are ignored because they are not persistent host storage.
-#   - overlay2/.../diff is intentionally skipped.
-#   - docker.sock, /etc/localtime, and /etc/timezone are intentionally ignored.
-#   - Additional CLI paths passed on CLI should be ABSOLUTE paths on the target host.
-# -------------------------------------------------------------------
 
 set -euo pipefail
 shopt -s nullglob
+umask 077
+export LC_ALL=C
 
 print_help() {
-  cat <<'EOF'
+    cat <<'EOF'
 Usage:
-  backup-script.sh [OPTIONS] <backup_user> <target_host> <backup_root> [<path1> [<path2> ...]]
+  backup-script.sh [OPTIONS] <backup_user> <target_host> <backup_root> [<absolute_remote_path> ...]
 
 Options:
-  -h               Show this help message and exit.
-  -s               Deprecated/no-op (live backup only; kept for compatibility).
-  -x cont1,cont2   Comma-separated list of Docker container names to exclude from stop/restart.
-                   Excluded containers are still inspected and their storage is still backed up live.
-  -e exclude_file  File containing rsync exclude patterns.
-  -n               Dry-run mode (true no-disruption mode: no container stop/start, rsync --dry-run).
-  -b MBPS          Bandwidth limit in MB/s for rsync.
-  -p streams       Number of parallel rsync streams (accepted, but forced to 1 for safety).
-  -P file          Absolute path to Portainer's own docker-compose.yml on the target host.
-                   When set, the script also discovers additional compose files inside Portainer.
+  -h              Show help.
+  -s              Deprecated; accepted for compatibility.
+  -x name1,name2  Exclude matching containers from stop/start, not from backup.
+  -e file         Local rsync exclude file.
+  -n              Dry run: no container changes, pruning or published backup.
+  -b MBPS         Limit rsync bandwidth in MB/s.
+  -p streams      Accepted for compatibility; transfers are sequential.
+  -P file         Remote Portainer Compose file; also discover managed Compose files.
 
-Description:
-  Performs a live backup from a remote host by:
-    - inspecting all running Docker containers,
-    - discovering host-side persistent storage paths,
-    - optionally discovering Portainer-managed compose files,
-    - optionally stopping non-excluded containers,
-    - backing up all discovered paths while preserving absolute paths,
-    - backing up any additional absolute paths specified on the command line,
-    - restarting previously stopped containers,
-    - pruning old backups/logs/manifests/source lists (keeping the 4 most recent).
+Environment:
+  BACKUP_MOUNTPOINT   Required local mount point (default: /mnt/sdb).
+  BACKUP_AUTO_PRUNE   1: allow space-driven pruning before backup (default);
+                      0: abort on insufficient space without pre-pruning.
 
-Examples:
-  backup-script.sh backup-user [BACKUP-TARGET-IP] ./backups
+Retention:
+  Keep up to four published generations after a successful backup.
+  Space-driven pruning protects at least the two newest published directories.
+  Logs and metadata are removed with their corresponding pruned generation.
 
-  backup-script.sh -x pihole backup-user [BACKUP-TARGET-IP] ./backups
-
-  backup-script.sh -n -x pihole -P /path/to/portainer/docker-compose.yml backup-user [BACKUP-TARGET-IP] ./backups
-
-  backup-script.sh -x pihole -P /path/to/portainer/docker-compose.yml backup-user [BACKUP-TARGET-IP] ./backups /etc
-
-Notes:
-  - Additional CLI paths must be absolute paths on the target host.
-  - Excluded containers keep running; their data is backed up live and may be inconsistent.
-  - overlay2 writable layers are intentionally skipped.
-  - docker.sock, /etc/localtime, and /etc/timezone are intentionally ignored.
+Example:
+  backup-script.sh -n -x pihole \
+    -P /home/marco/portainer/docker-compose.yml \
+    backup_worker 192.168.0.229 /mnt/sdb/backups
 EOF
 }
 
-# Early help
-for arg in "$@"; do
-  [[ "$arg" == "-h" ]] && { print_help; exit 0; }
-done
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
 
-# Defaults
+warn() {
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+DRY_RUN=false
 EXCLUDES=()
-EXCL_FILE=""
-DRY_RUN=""
-DRY_RUN_MODE=false
-BWLIMIT=""
-PARALLEL=1
-LIVE_ONLY=true
-PORTAINER_COMPOSE_FILE=""
+EXCL_FILE=''
+BWLIMIT=''
+PORTAINER_COMPOSE=''
+MOUNTPOINT=${BACKUP_MOUNTPOINT:-/mnt/sdb}
+AUTO_PRUNE=${BACKUP_AUTO_PRUNE:-1}
+KEEP=4
+PROTECT=2
+RESERVE_PERCENT=20
 
-while getopts ":hsx:e:nb:p:P:" opt; do
-  case "$opt" in
-    h) print_help; exit 0 ;;
-    s)
-      # Kept for compatibility only
-      LIVE_ONLY=true
-      ;;
-    x) IFS=',' read -r -a EXCLUDES <<< "$OPTARG" ;;
-    e) EXCL_FILE="$OPTARG" ;;
-    n)
-      DRY_RUN="--dry-run"
-      DRY_RUN_MODE=true
-      ;;
-    b) BWLIMIT="--bwlimit=$((OPTARG * 1024))" ;;
-    p) PARALLEL="$OPTARG" ;;
-    P) PORTAINER_COMPOSE_FILE="$OPTARG" ;;
-    *) print_help; exit 1 ;;
-  esac
+while getopts ':hsx:e:nb:p:P:' opt; do
+    case "$opt" in
+        h) print_help; exit 0 ;;
+        s) : ;;
+        x) IFS=',' read -r -a EXCLUDES <<< "$OPTARG" ;;
+        e) EXCL_FILE=$OPTARG ;;
+        n) DRY_RUN=true ;;
+        b)
+            [[ $OPTARG =~ ^[1-9][0-9]{0,6}$ ]] \
+                || die '-b requires a positive integer in MB/s.'
+            BWLIMIT=$((OPTARG * 1024))
+            ;;
+        p)
+            [[ $OPTARG =~ ^[1-9][0-9]*$ ]] \
+                || die '-p requires a positive integer.'
+            [[ $OPTARG == 1 ]] || warn 'Transfers are sequential; ignoring -p.'
+            ;;
+        P) PORTAINER_COMPOSE=$OPTARG ;;
+        :) die "Missing argument for -$OPTARG." ;;
+        *) die "Unknown option: -$OPTARG." ;;
+    esac
 done
-shift $((OPTIND - 1))
+shift "$((OPTIND - 1))"
 
-(( $# >= 3 )) || { echo "Insufficient arguments" >&2; print_help; exit 1; }
-
-BACKUP_USER="$1"
-TARGET_HOST="$2"
-BACKUP_ROOT="${3%/}"
+(( $# >= 3 )) || { print_help >&2; exit 1; }
+BACKUP_USER=$1
+TARGET_HOST=$2
+BACKUP_ROOT=$3
 shift 3
 EXTRA_PATHS=("$@")
 
-HOST_DIR="$BACKUP_ROOT/$TARGET_HOST"
-LOG_DIR="$HOST_DIR/logs"
-mkdir -p "$HOST_DIR" "$LOG_DIR"
+[[ $BACKUP_USER =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
+    || die 'Invalid SSH username.'
+[[ $TARGET_HOST =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] \
+    || die 'Use a DNS hostname or an IPv4 address as target.'
+[[ $AUTO_PRUNE == 0 || $AUTO_PRUNE == 1 ]] \
+    || die 'BACKUP_AUTO_PRUNE must be 0 or 1.'
+[[ -z $EXCL_FILE || -r $EXCL_FILE ]] \
+    || die "Cannot read rsync exclude file: $EXCL_FILE"
 
-TS=$(date +%F-%H-%M)
-LOG="$LOG_DIR/bklog_$TS.log"
-STOPPED_FILE="$HOST_DIR/stopped_containers_$TS.lst"
-MANIFEST_FILE="$HOST_DIR/manifest_$TS.tsv"
-SOURCE_LIST_FILE="$HOST_DIR/source_list_$TS.lst"
+# Check the mount before creating anything on the destination.
+mountpoint -q -- "$MOUNTPOINT" || die "Not mounted: $MOUNTPOINT"
+MOUNTPOINT=$(realpath -e -- "$MOUNTPOINT")
+BACKUP_ROOT=$(realpath -e -- "$BACKUP_ROOT") \
+    || die 'Backup root must already exist.'
+[[ -d $BACKUP_ROOT && -w $BACKUP_ROOT ]] \
+    || die "Backup root is not a writable directory: $BACKUP_ROOT"
+[[ $BACKUP_ROOT == "$MOUNTPOINT/"* ]] \
+    || die "Backup root must be below $MOUNTPOINT."
 
-# SSH options: let SSH choose the right key automatically
-SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-
-# Redirect all output to log and console
-exec > >(tee -a "$LOG") 2>&1
-
-echo "=== Backup started at $(date '+%F %T') ==="
-echo "Options: live-only=true, dry-run=${DRY_RUN:-no}, exclude-file=${EXCL_FILE:-none}, bwlimit=${BWLIMIT:-none}, streams=$PARALLEL, excludes=${EXCLUDES[*]:-none}, portainer-compose=${PORTAINER_COMPOSE_FILE:-none}"
-
-if (( PARALLEL > 1 )); then
-  echo "Warning: forcing streams=1 because concurrent rsync into one destination is unsafe in this design."
-  PARALLEL=1
-fi
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
-remote_ssh() {
-  ssh "${SSH_OPTS[@]}" "$BACKUP_USER@$TARGET_HOST" "$@"
+check_destination_mount() {
+    local actual
+    mountpoint -q -- "$MOUNTPOINT" \
+        || die "Required mount is unavailable: $MOUNTPOINT"
+    actual=$(findmnt -n -o TARGET --target "$1") \
+        || die "Cannot determine the filesystem for $1."
+    [[ $actual == "$MOUNTPOINT" ]] \
+        || die "Unexpected filesystem for $1: $actual"
 }
 
+check_destination_mount "$BACKUP_ROOT"
+
+HOST_DIR="$BACKUP_ROOT/$TARGET_HOST"
+LOG_DIR="$HOST_DIR/logs"
+
+[[ ! -L $HOST_DIR && ! -L $LOG_DIR ]] \
+    || die 'The host backup or log directory is a symbolic link.'
+mkdir -p -- "$HOST_DIR" "$LOG_DIR"
+check_destination_mount "$HOST_DIR"
+check_destination_mount "$LOG_DIR"
+
+# Protect direct invocations as well as invocations through the systemd runner.
+[[ ! -L $HOST_DIR/.backup-script.lock ]] || die 'Unsafe lock file.'
+exec 9>>"$HOST_DIR/.backup-script.lock"
+flock -n 9 || die "Another backup is already running for $TARGET_HOST."
+
+TS=$(date +%F-%H-%M)
+DEST="$HOST_DIR/full-$TS"
+STOPPED_FILE="$HOST_DIR/stopped_containers_$TS.lst"
+MANIFEST_OUT="$HOST_DIR/manifest_$TS.tsv"
+SOURCE_OUT="$HOST_DIR/source_list_$TS.lst"
+
+if $DRY_RUN; then
+    LOG=$(mktemp "$LOG_DIR/dryrun_${TS}.XXXXXX.log")
+else
+    LOG="$LOG_DIR/bklog_$TS.log"
+    for path in "$DEST" "$STOPPED_FILE" "$MANIFEST_OUT" "$SOURCE_OUT" "$LOG"; do
+        [[ ! -e $path && ! -L $path ]] \
+            || die "Output already exists: $path. Retry in a new minute."
+    done
+    : > "$LOG"
+fi
+
+# Continue forwarding output to the journal if the local log file fills up.
+exec > >(tee --output-error=warn -a -- "$LOG") 2>&1
+
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    -o ConnectTimeout=15
+    -o ServerAliveInterval=30
+    -o ServerAliveCountMax=3
+)
+SSH_RSYNC="ssh ${SSH_OPTS[*]}"
+
+remote_ssh() {
+    ssh "${SSH_OPTS[@]}" "$BACKUP_USER@$TARGET_HOST" "$@"
+}
+
+# Quote for the remote POSIX shell, including paths containing single quotes.
 shell_quote() {
-  printf "%q" "$1"
+    printf "'%s'" "${1//\'/\'\\\'\'}"
 }
 
 is_excluded() {
-  local name="$1"
-  local ex
-  for ex in "${EXCLUDES[@]}"; do
-    [[ "$name" == "$ex" || "$name" == *"$ex"* ]] && return 0
-  done
-  return 1
+    local name=$1 ex
+    for ex in "${EXCLUDES[@]}"; do
+        [[ -n $ex && $name == *"$ex"* ]] && return 0
+    done
+    return 1
 }
 
-remote_exists() {
-  local p="$1"
-  remote_ssh "sudo -n test -e $(shell_quote "$p")"
-}
-
-# Ignore explicitly unwanted paths
 is_ignored_source() {
-  local p="$1"
-
-  case "$p" in
-    /var/run/docker.sock) return 0 ;;
-    /etc/localtime) return 0 ;;
-    /etc/timezone) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Use an associative array to deduplicate actual backup sources
-declare -A UNIQUE_SOURCES=()
-declare -A SOURCE_REASON=()
-
-add_source() {
-  local path="$1"
-  local reason="$2"
-
-  [[ -n "$path" ]] || return 0
-
-  # Only absolute host paths make sense for this backup design
-  if [[ "$path" != /* ]]; then
-    echo "Skipping non-absolute path: $path (reason: $reason)"
-    return 0
-  fi
-
-  # Explicit ignore list
-  if is_ignored_source "$path"; then
-    echo "Ignoring path by policy: $path (reason: $reason)"
-    return 0
-  fi
-
-  # Skip overlay2 writable layer paths entirely
-  case "$path" in
-    /var/lib/docker/overlay2/*/diff|/var/lib/docker/overlay2/*)
-      echo "Ignoring overlay2 path by policy: $path (reason: $reason)"
-      return 0
-      ;;
-  esac
-
-  if [[ -z "${UNIQUE_SOURCES[$path]+x}" ]]; then
-    UNIQUE_SOURCES["$path"]=1
-    SOURCE_REASON["$path"]="$reason"
-  else
-    case " ${SOURCE_REASON[$path]} " in
-      *" $reason "*) ;;
-      *) SOURCE_REASON["$path"]="${SOURCE_REASON[$path]}; $reason" ;;
+    case "$1" in
+        /var/run/docker.sock|/run/docker.sock|/etc/localtime|/etc/timezone|\
+        /var/lib/docker/overlay2|/var/lib/docker/overlay2/*) return 0 ;;
+        *) return 1 ;;
     esac
-  fi
 }
 
-add_manifest_entry() {
-  local container="$1"
-  local state="$2"
-  local kind="$3"
-  local path="$4"
-  local notes="$5"
-  printf "%s\t%s\t%s\t%s\t%s\n" "$container" "$state" "$kind" "$path" "$notes" >> "$MANIFEST_FILE"
-}
-
-RESTART_DONE=false
+WORK_DIR=''
+PUBLISHED=false
+METADATA_STARTED=false
+RESTART_ATTEMPTED=false
+RESTART_OK=true
+STOPPED_CONTAINERS=()
 
 restart_containers() {
-  # No stop/start at all in dry-run mode
-  if $DRY_RUN_MODE; then
-    rm -f "$STOPPED_FILE"
-    RESTART_DONE=true
-    return 0
-  fi
+    local i c state
+    if $RESTART_ATTEMPTED; then
+        "$RESTART_OK"
+        return
+    fi
+    RESTART_ATTEMPTED=true
+    if (( ${#STOPPED_CONTAINERS[@]} == 0 )); then
+        return 0
+    fi
 
-  # Avoid running twice
-  if $RESTART_DONE; then
-    return 0
-  fi
-
-  if [[ -s "$STOPPED_FILE" ]]; then
-    echo "=== Restarting containers at $(date '+%F %T') ==="
-    mapfile -t STOPPED < "$STOPPED_FILE"
-    local c
-    for c in "${STOPPED[@]}"; do
-      echo "Starting $c"
-      if ! remote_ssh "sudo -n docker start $(shell_quote "$c") >/dev/null"; then
-        echo "Error: failed to start $c" >&2
-      fi
+    echo '=== Restarting containers ==='
+    for ((i=${#STOPPED_CONTAINERS[@]}-1; i>=0; i--)); do
+        c=${STOPPED_CONTAINERS[i]}
+        echo "Starting $c"
+        if ! remote_ssh "sudo -n docker start $(shell_quote "$c") >/dev/null"; then
+            warn "Failed to start $c"
+            RESTART_OK=false
+            continue
+        fi
+        if ! state=$(remote_ssh \
+            "sudo -n docker inspect --format '{{.State.Running}}' $(shell_quote "$c")") \
+            || [[ $state != true ]]; then
+            warn "Could not confirm running state for $c"
+            RESTART_OK=false
+        fi
     done
-  fi
 
-  rm -f "$STOPPED_FILE"
-  RESTART_DONE=true
+    if $RESTART_OK; then
+        if ! rm -f -- "$STOPPED_FILE"; then
+            warn "Could not remove recovery list: $STOPPED_FILE"
+            return 1
+        fi
+        return 0
+    fi
+
+    warn "Restart incomplete. Recovery list retained: $STOPPED_FILE"
+    return 1
 }
 
-# Fallback restart on abnormal exits
 cleanup_on_exit() {
-  local rc=$?
-  restart_containers || true
-  return "$rc"
+    local rc=$?
+    trap - EXIT
+    if ! restart_containers; then
+        rc=1
+    fi
+
+    if [[ -n $WORK_DIR ]] || { $METADATA_STARTED && ! $PUBLISHED; }; then
+        local actual
+        if mountpoint -q -- "$MOUNTPOINT" \
+            && actual=$(findmnt -n -o TARGET --target "$HOST_DIR") \
+            && [[ $actual == "$MOUNTPOINT" ]]; then
+            if $METADATA_STARTED && ! $PUBLISHED; then
+                rm -f -- "$MANIFEST_OUT" "$SOURCE_OUT" || rc=1
+            fi
+            if [[ -n $WORK_DIR ]]; then
+                rm -rf --one-file-system -- "$WORK_DIR" || rc=1
+            fi
+        else
+            warn 'Destination filesystem changed; skipping local cleanup.'
+            rc=1
+        fi
+    fi
+
+    if (( rc != 0 )); then
+        warn "Backup job ended with exit code $rc. See $LOG"
+    fi
+    exit "$rc"
 }
 trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# -----------------------------------------------------------------------------
-# Pre-flight checks
-# -----------------------------------------------------------------------------
+WORK_DIR=$(mktemp -d "$HOST_DIR/.backup-work-${TS}.XXXXXX")
+STAGE="$WORK_DIR/data"
+MANIFEST="$WORK_DIR/manifest.tsv"
+SOURCE_LIST="$WORK_DIR/source_list.lst"
+mkdir -- "$STAGE"
+printf 'container\tstate\tkind\tpath\tnotes\n' > "$MANIFEST"
 
-echo "=== Pre-flight checks ==="
-remote_ssh "true"
-remote_ssh "sudo -n docker ps >/dev/null"
-remote_ssh "sudo -n rsync --version >/dev/null"
-remote_ssh "sudo -n test -d /var/lib/docker >/dev/null || true"
+declare -A SOURCES=()
+FINAL_SOURCES=()
 
-if [[ -n "$PORTAINER_COMPOSE_FILE" ]]; then
-  if [[ "$PORTAINER_COMPOSE_FILE" != /* ]]; then
-    echo "Error: -P requires an absolute target path to Portainer's docker-compose.yml" >&2
-    exit 1
-  fi
-  remote_ssh "sudo -n find / >/dev/null 2>&1 || true"
+add_source() {
+    local source=$1 container=$2 state=$3 kind=$4 notes=$5
+
+    if is_ignored_source "$source"; then
+        return 0
+    fi
+
+    [[ $source == /* && $source != / && $source != *[[:cntrl:]]* ]] \
+        || die "Unsupported source path: $source"
+    case "$source/" in
+        */../*|*/./*) die "Source path must not contain . or .. components: $source" ;;
+    esac
+
+    source=${source%/}
+    SOURCES["$source"]=1
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$container" "$state" "$kind" "$source" "$notes" >> "$MANIFEST"
+}
+
+echo "=== Backup started at $(date '+%F %T') (dry run: $DRY_RUN) ==="
+echo "Source: $TARGET_HOST; destination: $HOST_DIR"
+
+remote_ssh 'true' || die 'SSH preflight failed.'
+remote_ssh 'sudo -n rsync --version >/dev/null' \
+    || die 'Remote rsync preflight failed.'
+
+running_output=$(remote_ssh "sudo -n docker ps --format '{{.Names}}'") \
+    || die 'Could not list running containers.'
+RUNNING_CONTAINERS=()
+if [[ -n $running_output ]]; then
+    mapfile -t RUNNING_CONTAINERS <<< "$running_output"
 fi
+echo "Running containers: ${#RUNNING_CONTAINERS[@]}"
 
-# -----------------------------------------------------------------------------
-# Discover running containers
-# -----------------------------------------------------------------------------
-
-declare -a RUNNING_CONTAINERS=()
-mapfile -t RUNNING_CONTAINERS < <(remote_ssh "sudo -n docker ps --format '{{.Names}}'")
-
-echo "=== Running containers detected: ${#RUNNING_CONTAINERS[@]} ==="
-if (( ${#RUNNING_CONTAINERS[@]} > 0 )); then
-  printf ' - %s\n' "${RUNNING_CONTAINERS[@]}"
-else
-  echo "No running containers found."
-fi
-
-# Manifest header
-printf "container\tstate\tkind\tpath\tnotes\n" > "$MANIFEST_FILE"
-
-# -----------------------------------------------------------------------------
-# Discover storage used by running containers
-# -----------------------------------------------------------------------------
-
-echo "=== Discovering container storage on target ==="
+MOUNT_FORMAT='{{range .Mounts}}{{if and .Source (or (eq .Type "bind") (eq .Type "volume"))}}{{printf "%s\x1f%s\n" .Type .Source}}{{end}}{{end}}'
 
 for c in "${RUNNING_CONTAINERS[@]}"; do
-  container_state="stopped-for-backup"
-  if is_excluded "$c"; then
-    container_state="live-excluded"
-  elif $DRY_RUN_MODE; then
-    container_state="would-stop-for-backup"
-  fi
-
-  echo "--- Inspecting container: $c ($container_state) ---"
-
-  # Discover mounts
-  # Output format per line:
-  #   TYPE <US> SOURCE
-  # where <US> = unit separator 0x1F
-  mapfile -t mount_lines < <(
-    remote_ssh "sudo -n docker inspect $(shell_quote "$c") --format '{{range .Mounts}}{{if and .Source (or (eq .Type \"bind\") (eq .Type \"volume\"))}}{{printf \"%s\\x1f%s\\n\" .Type .Source}}{{end}}{{end}}'"
-  )
-
-  if (( ${#mount_lines[@]} > 0 )); then
-    for line in "${mount_lines[@]}"; do
-      IFS=$'\x1f' read -r mtype msource <<< "$line"
-      [[ -n "${msource:-}" ]] || continue
-
-      add_source "$msource" "container=$c kind=$mtype state=$container_state"
-
-      if ! is_ignored_source "$msource" && [[ "$msource" != /var/lib/docker/overlay2/* ]]; then
-        add_manifest_entry "$c" "$container_state" "$mtype" "$msource" "-"
-        echo "  found $mtype: $msource"
-      fi
-    done
-  else
-    echo "  no persistent bind/volume mounts found"
-  fi
-done
-
-# -----------------------------------------------------------------------------
-# Optional: discover Portainer environments compose files
-# -----------------------------------------------------------------------------
-
-if [[ -n "$PORTAINER_COMPOSE_FILE" ]]; then
-  echo "=== Discovering Portainer compose files ==="
-
-  # Always back up Portainer's own docker-compose.yml
-  add_source "$PORTAINER_COMPOSE_FILE" "portainer-root-compose"
-  add_manifest_entry "portainer" "config" "compose-file" "$PORTAINER_COMPOSE_FILE" "Portainer own docker-compose.yml"
-  echo "  added Portainer compose file: $PORTAINER_COMPOSE_FILE"
-
-  # Find a Portainer container among running containers
-  PORTAINER_CONTAINER=""
-  for c in "${RUNNING_CONTAINERS[@]}"; do
-    if [[ "$c" == *portainer* ]]; then
-      PORTAINER_CONTAINER="$c"
-      break
-    fi
-  done
-
-  if [[ -z "$PORTAINER_CONTAINER" ]]; then
-    echo "Warning: no running Portainer container found; cannot auto-discover Portainer-managed compose files." >&2
-  else
-    echo "  using Portainer container: $PORTAINER_CONTAINER"
-
-    # Find the host-side source mounted to /data in Portainer
-    PORTAINER_DATA_SOURCE="$(
-      remote_ssh "sudo -n docker inspect $(shell_quote "$PORTAINER_CONTAINER") --format '{{range .Mounts}}{{if eq .Destination \"/data\"}}{{printf \"%s\" .Source}}{{end}}{{end}}'" \
-        || true
-    )"
-
-    if [[ -z "$PORTAINER_DATA_SOURCE" ]]; then
-      echo "Warning: could not determine Portainer data source mount (/data) from container $PORTAINER_CONTAINER" >&2
-    else
-      echo "  Portainer data source: $PORTAINER_DATA_SOURCE"
-
-      # Find compose files inside Portainer data source
-      mapfile -t PORTAINER_COMPOSE_FILES < <(
-        remote_ssh "sudo -n find $(shell_quote "$PORTAINER_DATA_SOURCE") -type f \\( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \\) 2>/dev/null" \
-          || true
-      )
-
-      if (( ${#PORTAINER_COMPOSE_FILES[@]} > 0 )); then
-        echo "  found ${#PORTAINER_COMPOSE_FILES[@]} Portainer-managed compose file(s)"
-        for f in "${PORTAINER_COMPOSE_FILES[@]}"; do
-          add_source "$f" "portainer-managed-compose"
-          add_manifest_entry "portainer" "config" "compose-file" "$f" "Discovered inside Portainer data source"
-          echo "    compose file: $f"
-        done
-      else
-        echo "  no additional compose files found inside Portainer data source"
-      fi
-    fi
-  fi
-fi
-
-# -----------------------------------------------------------------------------
-# Add extra CLI paths
-# -----------------------------------------------------------------------------
-
-if (( ${#EXTRA_PATHS[@]} > 0 )); then
-  echo "=== Processing additional CLI paths ==="
-  for p in "${EXTRA_PATHS[@]}"; do
-    if [[ "$p" != /* ]]; then
-      echo "Skipping additional path because it is not absolute: $p"
-      add_manifest_entry "-" "-" "extra" "$p" "skipped: not absolute"
-      continue
-    fi
-    add_source "$p" "extra-cli-path"
-    if ! is_ignored_source "$p" && [[ "$p" != /var/lib/docker/overlay2/* ]]; then
-      add_manifest_entry "-" "-" "extra" "$p" "from CLI"
-      echo "  added extra path: $p"
-    fi
-  done
-fi
-
-# -----------------------------------------------------------------------------
-# Validate collected sources on target
-# -----------------------------------------------------------------------------
-
-echo "=== Validating discovered sources on target ==="
-
-: > "$SOURCE_LIST_FILE"
-
-mapfile -t SORTED_SOURCES < <(printf '%s\n' "${!UNIQUE_SOURCES[@]}" | sort)
-
-if (( ${#SORTED_SOURCES[@]} == 0 )); then
-  echo "No sources were discovered and no valid extra paths were provided."
-  echo "Nothing to back up."
-  exit 1
-fi
-
-for src in "${SORTED_SOURCES[@]}"; do
-  if remote_exists "$src"; then
-    printf "%s\n" "$src" >> "$SOURCE_LIST_FILE"
-    echo "  OK: $src"
-  else
-    echo "  MISSING: $src (reason: ${SOURCE_REASON[$src]})"
-    add_manifest_entry "-" "-" "missing" "$src" "${SOURCE_REASON[$src]}"
-  fi
-done
-
-mapfile -t FINAL_SOURCES < "$SOURCE_LIST_FILE"
-
-if (( ${#FINAL_SOURCES[@]} == 0 )); then
-  echo "All discovered sources were missing or inaccessible on the target."
-  exit 1
-fi
-
-echo "=== Final backup source count: ${#FINAL_SOURCES[@]} ==="
-printf ' - %s\n' "${FINAL_SOURCES[@]}"
-
-# -----------------------------------------------------------------------------
-# Stop non-excluded running containers
-# -----------------------------------------------------------------------------
-
-if $DRY_RUN_MODE; then
-  echo "=== Dry-run mode: skipping container stop/start (no-disruption) ==="
-else
-  echo "=== Stopping non-excluded containers ==="
-  : > "$STOPPED_FILE"
-
-  for c in "${RUNNING_CONTAINERS[@]}"; do
+    state=stopped-for-backup
     if is_excluded "$c"; then
-      echo "Skipping stop for excluded container: $c"
-      echo "Warning: $c remains running, so its data is backed up live and may be inconsistent."
-      continue
+        state=live-excluded
+    elif $DRY_RUN; then
+        state=would-stop-for-backup
     fi
 
-    echo "Stopping $c"
-    if remote_ssh "sudo -n docker stop $(shell_quote "$c") >/dev/null"; then
-      echo "$c" >> "$STOPPED_FILE"
-    else
-      echo "Warning: failed to stop $c; proceeding, but backup consistency may be affected." >&2
+    mounts=$(remote_ssh \
+        "sudo -n docker inspect --format $(shell_quote "$MOUNT_FORMAT") $(shell_quote "$c")") \
+        || die "Mount discovery failed for $c."
+
+    if [[ -n $mounts ]]; then
+        while IFS=$'\x1f' read -r kind source; do
+            [[ -n $source ]] || die "Invalid mount output for $c."
+            add_source "$source" "$c" "$state" "$kind" '-'
+        done <<< "$mounts"
     fi
-  done
+done
+
+if [[ -n $PORTAINER_COMPOSE ]]; then
+    add_source "$PORTAINER_COMPOSE" portainer config compose-file 'Portainer own Compose file'
+
+    PORTAINER_DATA=''
+    DATA_FORMAT='{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}'
+    for c in "${RUNNING_CONTAINERS[@]}"; do
+        [[ $c == *portainer* ]] || continue
+        PORTAINER_DATA=$(remote_ssh \
+            "sudo -n docker inspect --format $(shell_quote "$DATA_FORMAT") $(shell_quote "$c")") \
+            || die "Could not inspect Portainer candidate $c."
+        [[ -n $PORTAINER_DATA ]] && break
+    done
+    [[ -n $PORTAINER_DATA ]] \
+        || die 'Requested Portainer backup, but found no running Portainer container with a /data mount.'
+
+    compose_files=$(remote_ssh \
+        "sudo -n find $(shell_quote "$PORTAINER_DATA") -type f \
+        \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' \
+        -o -name 'compose.yml' -o -name 'compose.yaml' \)") \
+        || die 'Portainer Compose discovery failed.'
+
+    if [[ -n $compose_files ]]; then
+        while IFS= read -r source; do
+            add_source "$source" portainer config compose-file 'Discovered in Portainer data'
+        done <<< "$compose_files"
+    fi
 fi
 
-# -----------------------------------------------------------------------------
-# Prepare destination
-# -----------------------------------------------------------------------------
+for source in "${EXTRA_PATHS[@]}"; do
+    add_source "$source" '-' '-' extra 'Requested on command line'
+done
 
-DEST="$HOST_DIR/full-$TS"
-mkdir -p "$DEST"
+(( ${#SOURCES[@]} > 0 )) || die 'No backup sources discovered.'
 
-# -----------------------------------------------------------------------------
-# Build rsync options
-# -----------------------------------------------------------------------------
+printf '%s\n' "${!SOURCES[@]}" | sort > "$SOURCE_LIST"
+mapfile -t FINAL_SOURCES < "$SOURCE_LIST"
+
+for source in "${FINAL_SOURCES[@]}"; do
+    remote_ssh "sudo -n test -e $(shell_quote "$source")" \
+        || die "Backup source missing or inaccessible: $source"
+done
 
 RS_OPTS=(
-  -aHAX
-  --numeric-ids
-  --relative
-  --protect-args
-  --info=progress2
+    -aHAX --numeric-ids --relative --protect-args
+    --exclude=/var/run/docker.sock
+    --exclude=/run/docker.sock
+    --exclude=/etc/localtime
+    --exclude=/etc/timezone
+    '--exclude=/var/lib/docker/overlay2/***'
 )
+if [[ -n $BWLIMIT ]]; then
+    RS_OPTS+=(--bwlimit="$BWLIMIT")
+fi
+if [[ -n $EXCL_FILE ]]; then
+    RS_OPTS+=(--exclude-from="$EXCL_FILE")
+fi
 
-[[ -n "$DRY_RUN" ]] && RS_OPTS+=("$DRY_RUN")
-[[ -n "$BWLIMIT" ]] && RS_OPTS+=("$BWLIMIT")
-[[ -n "$EXCL_FILE" ]] && RS_OPTS+=(--exclude-from="$EXCL_FILE")
+run_rsync() {
+    local source=$1
+    shift
+    rsync "${RS_OPTS[@]}" "$@" \
+        -e "$SSH_RSYNC" \
+        --rsync-path='sudo -n rsync' \
+        "$BACKUP_USER@$TARGET_HOST:/./${source#/}" \
+        "$STAGE/"
+}
 
-SSH_RSYNC="ssh ${SSH_OPTS[*]}"
+free_bytes() {
+    df -B1 --output=avail -- "$HOST_DIR" | awk 'NR == 2 {print $1}'
+}
 
-# -----------------------------------------------------------------------------
-# Run rsync for each source sequentially
-# -----------------------------------------------------------------------------
+free_inodes() {
+    df --output=iavail -- "$HOST_DIR" | awk 'NR == 2 {print $1}'
+}
 
-echo "=== Running rsync at $(date '+%F %T') ==="
+estimate_requirements() {
+    local source stats bytes files
+    local total_bytes=0 total_files=0
 
-FAILED=0
+    echo '=== Estimating required space with rsync dry runs ==='
+    for source in "${FINAL_SOURCES[@]}"; do
+        echo "Estimating: $source"
+        stats=$(run_rsync "$source" --dry-run --stats) \
+            || die "Could not estimate source: $source"
 
-for src in "${FINAL_SOURCES[@]}"; do
-  REMOTE_SRC="${BACKUP_USER}@${TARGET_HOST}:/./${src#/}"
+        bytes=$(awk -F ': *' '/^Total file size:/ {
+            split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit
+        }' <<< "$stats")
+        files=$(awk -F ': *' '/^Number of files:/ {
+            split($2,a," "); gsub(/,/,"",a[1]); print a[1]; exit
+        }' <<< "$stats")
 
-  CMD=(
-    rsync
-    "${RS_OPTS[@]}"
-    -e "$SSH_RSYNC"
-    --rsync-path="sudo -n rsync"
-    "$REMOTE_SRC"
-    "$DEST/"
-  )
+        [[ $bytes =~ ^[0-9]+$ && $files =~ ^[0-9]+$ ]] \
+            || die "Could not parse rsync statistics for $source."
+        total_bytes=$((total_bytes + bytes))
+        total_files=$((total_files + files))
+    done
 
-  echo "+ ${CMD[*]}"
-  if ! "${CMD[@]}"; then
-    echo "Warning: rsync failed for source: $src" >&2
-    FAILED=1
-  fi
+    # Estimate conservatively: overlapping sources may be counted twice.
+    REQUIRED_BYTES=$((total_bytes + total_bytes * RESERVE_PERCENT / 100 + 1073741824))
+    REQUIRED_INODES=$((total_files + total_files * RESERVE_PERCENT / 100 + 1024))
+}
+
+list_generations() {
+    local dir name
+    GENERATIONS=()
+    # LC_ALL=C + the timestamp format puts the oldest generation first.
+    for dir in "$HOST_DIR"/full-*; do
+        [[ -d $dir && ! -L $dir ]] || continue
+        name=${dir##*/}
+        [[ $name =~ ^full-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] \
+            || continue
+        GENERATIONS+=("$dir")
+    done
+}
+
+prune_generation() {
+    local dir=$1 name stamp
+    name=${dir##*/}
+    stamp=${name#full-}
+
+    [[ ${dir%/*} == "$HOST_DIR" && -d $dir && ! -L $dir \
+        && $name =~ ^full-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] \
+        || die "Refusing to prune unexpected path: $dir"
+    check_destination_mount "$dir"
+    echo "Pruning generation: $name"
+    rm -rf --one-file-system -- "$dir" \
+        || die "Failed to remove generation $name."
+    [[ ! -e $dir ]] || die "Generation still exists after pruning: $name"
+
+    rm -f -- "$HOST_DIR/manifest_$stamp.tsv" \
+        "$HOST_DIR/source_list_$stamp.lst" "$LOG_DIR/bklog_$stamp.log" \
+        || die "Failed to remove metadata for $name."
+}
+
+read_capacity() {
+    AVAILABLE_BYTES=$(free_bytes) || die 'Could not read free bytes.'
+    AVAILABLE_INODES=$(free_inodes) || die 'Could not read free inodes.'
+    [[ $AVAILABLE_BYTES =~ ^[0-9]+$ && $AVAILABLE_INODES =~ ^[0-9]+$ ]] \
+        || die 'Destination did not report numeric byte and inode availability.'
+}
+
+has_capacity() {
+    (( AVAILABLE_BYTES >= REQUIRED_BYTES && AVAILABLE_INODES >= REQUIRED_INODES ))
+}
+
+ensure_capacity() {
+    local candidates i dir bytes inodes
+    local possible_bytes possible_inodes
+
+    read_capacity
+    printf 'Capacity: %s bytes and %s inodes free; %s bytes and %s inodes required.\n' \
+        "$AVAILABLE_BYTES" "$AVAILABLE_INODES" "$REQUIRED_BYTES" "$REQUIRED_INODES"
+
+    if has_capacity; then
+        return 0
+    fi
+    if $DRY_RUN; then
+        die 'Insufficient capacity. Dry run did not remove any backups.'
+    fi
+    [[ $AUTO_PRUNE == 1 ]] \
+        || die 'Insufficient capacity; automatic pre-pruning is disabled.'
+
+    list_generations
+    candidates=$((${#GENERATIONS[@]} - PROTECT))
+    (( candidates > 0 )) \
+        || die "Insufficient capacity; preserving the newest $PROTECT generations."
+
+    # Plan first. Do not remove any generation if the estimated recoverable
+    # capacity is insufficient even after pruning all eligible generations.
+    possible_bytes=$AVAILABLE_BYTES
+    possible_inodes=$AVAILABLE_INODES
+    for ((i=0; i<candidates; i++)); do
+        dir=${GENERATIONS[i]}
+        bytes=$(du -sx -B1 -- "$dir" | cut -f1) \
+            || die "Could not measure reclaimable bytes for $dir."
+        inodes=$(du -sx --inodes -- "$dir" | cut -f1) \
+            || die "Could not measure reclaimable inodes for $dir."
+        [[ $bytes =~ ^[0-9]+$ && $inodes =~ ^[0-9]+$ ]] \
+            || die "Unexpected disk usage output for $dir."
+        possible_bytes=$((possible_bytes + bytes))
+        possible_inodes=$((possible_inodes + inodes))
+        if (( possible_bytes >= REQUIRED_BYTES && possible_inodes >= REQUIRED_INODES )); then
+            break
+        fi
+    done
+
+    (( possible_bytes >= REQUIRED_BYTES && possible_inodes >= REQUIRED_INODES )) \
+        || die 'Pruning eligible generations would not provide enough capacity. Nothing was pruned.'
+
+    # Shared blocks can make du optimistic. Recheck actual free space
+    # after each removal and stop as soon as there is sufficient capacity.
+    for ((i=0; i<candidates; i++)); do
+        prune_generation "${GENERATIONS[i]}"
+        read_capacity
+        if has_capacity; then
+            echo 'Capacity check passed after pruning.'
+            return 0
+        fi
+    done
+
+    die 'Insufficient free space after pruning eligible generations.'
+}
+
+estimate_requirements
+ensure_capacity
+
+if $DRY_RUN; then
+    echo '=== Dry run complete: sources and capacity checked; no backup was published. ==='
+    exit 0
+fi
+
+check_destination_mount "$STAGE"
+read_capacity
+has_capacity || die 'Destination capacity changed before container shutdown.'
+
+echo '=== Stopping non-excluded containers ==='
+for c in "${RUNNING_CONTAINERS[@]}"; do
+    if is_excluded "$c"; then
+        warn "$c stays running; its data is backed up live and may be inconsistent."
+        continue
+    fi
+
+    # Record the restart intent before sending docker stop, so a lost SSH
+    # response after a successful stop does not leave the container forgotten.
+    printf '%s\n' "$c" >> "$STOPPED_FILE"
+    STOPPED_CONTAINERS+=("$c")
+    echo "Stopping $c"
+    remote_ssh "sudo -n docker stop $(shell_quote "$c") >/dev/null" \
+        || die "Could not confirm that $c stopped; aborting the backup."
 done
 
-# -----------------------------------------------------------------------------
-# Explicitly restart containers now (trap remains as fallback)
-# -----------------------------------------------------------------------------
+echo '=== Copying backup data ==='
+for source in "${FINAL_SOURCES[@]}"; do
+    echo "Backing up: $source"
+    if run_rsync "$source" --info=progress2; then
+        :
+    else
+        rc=$?
+        die "rsync failed with exit code $rc for $source."
+    fi
+done
 
-restart_containers || true
+restart_containers || die 'Not all containers could be restarted.'
 
-# -----------------------------------------------------------------------------
-# Prune old backups (keep 4) and corresponding logs/manifests/source lists
-# -----------------------------------------------------------------------------
+# Keep the Restore and Runner naming conventions unchanged.
+# Publish with a same-filesystem rename only after transfer and restart checks.
+check_destination_mount "$STAGE"
+METADATA_STARTED=true
+mv -T -- "$MANIFEST" "$MANIFEST_OUT"
+mv -T -- "$SOURCE_LIST" "$SOURCE_OUT"
+[[ ! -e $DEST && ! -L $DEST ]] || die "Backup destination already exists: $DEST"
+mv -T -- "$STAGE" "$DEST"
+PUBLISHED=true
 
-cd "$HOST_DIR"
+list_generations
+excess=$((${#GENERATIONS[@]} - KEEP))
+for ((i=0; i<excess; i++)); do
+    prune_generation "${GENERATIONS[i]}"
+done
 
-echo "=== Pruning old backups/logs (keep 4) ==="
-
-# Prune backups
-fulls=(full-*)
-if (( ${#fulls[@]} > 4 )); then
-  IFS=$'\n' sorted=( $(printf "%s\n" "${fulls[@]}" | sort) )
-  unset IFS
-  to_remove=( "${sorted[@]:0:${#sorted[@]}-4}" )
-  for old in "${to_remove[@]}"; do
-    echo "Removing old backup: $old"
-    rm -rf -- "$old"
-  done
-fi
-
-# Prune logs
-logs=(logs/bklog_*.log)
-if (( ${#logs[@]} > 4 )); then
-  IFS=$'\n' sorted_logs=( $(printf "%s\n" "${logs[@]}" | sort) )
-  unset IFS
-  old_logs=( "${sorted_logs[@]:0:${#sorted_logs[@]}-4}" )
-  for lf in "${old_logs[@]}"; do
-    echo "Removing old log: $lf"
-    rm -f -- "$lf"
-  done
-fi
-
-# Prune manifests
-manifests=(manifest_*.tsv)
-if (( ${#manifests[@]} > 4 )); then
-  IFS=$'\n' sorted_manifests=( $(printf "%s\n" "${manifests[@]}" | sort) )
-  unset IFS
-  old_manifests=( "${sorted_manifests[@]:0:${#sorted_manifests[@]}-4}" )
-  for mf in "${old_manifests[@]}"; do
-    echo "Removing old manifest: $mf"
-    rm -f -- "$mf"
-  done
-fi
-
-# Prune source lists
-source_lists=(source_list_*.lst)
-if (( ${#source_lists[@]} > 4 )); then
-  IFS=$'\n' sorted_lists=( $(printf "%s\n" "${source_lists[@]}" | sort) )
-  unset IFS
-  old_lists=( "${sorted_lists[@]:0:${#sorted_lists[@]}-4}" )
-  for sf in "${old_lists[@]}"; do
-    echo "Removing old source list: $sf"
-    rm -f -- "$sf"
-  done
-fi
-
-echo "=== Backup finished at $(date '+%F %T') ==="
-
-exit "$FAILED"
+echo "=== Backup published at $(date '+%F %T'): $DEST ==="
