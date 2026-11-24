@@ -94,45 +94,248 @@ backup-script.sh [OPTIONS] <backup_user> <target_host> <backup_root> [<path1> [<
 
 ## Description
 
-`backup-script.sh` performs a **live backup** from the target host.
+`backup-script.sh` performs a **live backup** from a remote Docker host.
+
+The script automatically discovers persistent Docker storage, optionally includes Portainer-managed compose files, validates available backup capacity before stopping containers, and publishes a backup only after the transfer and container restart checks complete successfully.
 
 ### Workflow
 
-1. Connects to the target host via SSH.
-2. Detects all **currently running Docker containers**.
-3. Inspects each running container and discovers host-side persistent storage:
+1. Validates that the configured backup filesystem is mounted and the backup destination is writable.
+2. Acquires a lock to prevent concurrent backup runs.
+3. Connects to the target host via SSH.
+4. Detects all **currently running Docker containers**.
+5. Inspects each running container and discovers host-side persistent storage:
    - bind mounts
-   - named and anonymous Docker volumes
-4. Optionally discovers Portainer-managed compose files when `-P` is used.
-5. In a **real run**, stops all running containers **except** those excluded with `-x`.
-6. In a **dry-run**, skips all container stop/start operations completely.
-7. Backs up all discovered storage paths to the backup directory while preserving their **full absolute paths**.
-8. Also backs up any **additional absolute paths** specified on the command line.
-9. Restarts the previously stopped containers automatically (real runs only).
-10. Prunes old backups and metadata files, keeping the **4 most recent** runs.
+   - named Docker volumes
+   - anonymous Docker volumes
+6. Optionally discovers Portainer-managed compose files when `-P` is used.
+7. Adds any additional absolute paths supplied on the command line.
+8. Validates that all selected source paths exist on the target.
+9. Uses `rsync --dry-run --stats` to estimate the size and inode requirements of the upcoming backup.
+10. Adds a safety margin to the estimated storage requirements.
+11. Verifies that sufficient local backup capacity is available.
+12. If enabled and required, removes eligible old backup generations **before** stopping containers.
+13. In a **real run**, stops all running containers except those excluded with `-x`.
+14. Copies all selected storage paths into a temporary staging directory while preserving their **full absolute paths**.
+15. Restarts all containers that were stopped for the backup.
+16. Publishes the completed staging directory as `full-YYYY-MM-DD-HH-MM/` only after the copy and restart checks succeed.
+17. Applies normal retention, keeping the **4 most recent published backup generations**.
+18. Removes temporary data and incomplete metadata when a backup fails.
 
 ## Important Behavior
 
 - Excluded containers are **still inspected**, and their discovered storage is **still backed up**.
 - Excluded containers are **not stopped**, so their storage is backed up **live** and may therefore be inconsistent.
 - `tmpfs` mounts are ignored because they are not persistent storage.
-- `overlay2` writable layer paths are intentionally skipped.
-- Additional CLI paths must be **absolute target paths**.
-- In dry-run mode, the script performs **no-disruption validation** only.
+- Docker `overlay2` writable layer paths are intentionally skipped.
+- `/var/run/docker.sock`, `/run/docker.sock`, `/etc/localtime`, and `/etc/timezone` are intentionally ignored.
+- Additional CLI paths must be **absolute paths on the target host**.
+- Concurrent backup runs for the same target are prevented using a local `flock`.
+- The backup destination must reside below the configured backup mount point.
+- The script verifies that the expected backup filesystem is mounted before writing or deleting backup data.
+- A failed backup is **not published as a valid `full-*` backup generation**.
+- Container restart failures cause the backup run to fail.
+- The container recovery list is retained when not all containers can be restarted successfully.
+- Backup transfers are intentionally sequential. The `-p` option remains accepted for compatibility but does not enable parallel transfers.
+
+## Storage Preflight
+
+Before stopping any containers, the script estimates how much disk space and how many inodes are required for the next backup.
+
+The estimate is calculated using:
+
+```bash
+rsync --dry-run --stats
+```
+
+for every selected backup source.
+
+The script then adds:
+
+- **20% safety margin**
+- an additional **1 GiB disk-space margin**
+- an additional inode margin
+
+Example:
+
+```text
+Capacity: 403342786560 bytes and 60299406 inodes free;
+301031362188 bytes and 407896 inodes required.
+```
+
+The backup only proceeds when sufficient capacity is available.
+
+The estimate is intentionally conservative and is not an absolute guarantee. Source data can change between the dry-run estimation and the actual transfer.
+
+### Automatic pre-pruning
+
+By default:
+
+```bash
+BACKUP_AUTO_PRUNE=1
+```
+
+If insufficient space is available, the script may remove eligible old backup generations **before** containers are stopped.
+
+The two newest published backup generations are protected from this pre-pruning process.
+
+The script first calculates whether deleting the eligible generations is expected to free enough capacity. If even deleting all eligible generations would not provide sufficient space, the backup aborts without performing the pre-pruning.
+
+After each deletion, the actual available filesystem capacity is checked again.
+
+Automatic pre-pruning can be disabled:
+
+```bash
+BACKUP_AUTO_PRUNE=0 backup-script.sh ...
+```
+
+With automatic pre-pruning disabled, insufficient capacity causes the backup to abort.
+
+## Backup Mount Validation
+
+The default backup mount point is:
+
+```text
+/mnt/sdb
+```
+
+It can be overridden using:
+
+```bash
+BACKUP_MOUNTPOINT=/path/to/mount backup-script.sh ...
+```
+
+The script verifies that:
+
+1. the configured mount point is actually mounted,
+2. the backup root already exists,
+3. the backup root is writable,
+4. the backup root resides below the expected mount point,
+5. the filesystem does not unexpectedly change during the backup process.
+
+This prevents the script from accidentally writing large backups to the root filesystem if the intended backup disk is not mounted.
+
+## Backup Staging and Publication
+
+A new backup is initially written into a temporary staging directory:
+
+```text
+<backup_root>/<target_host>/.backup-work-<timestamp>.<random>/
+```
+
+The final backup directory:
+
+```text
+full-YYYY-MM-DD-HH-MM/
+```
+
+is created only after:
+
+1. all selected sources were transferred successfully,
+2. previously stopped containers were restarted successfully,
+3. the backup metadata was prepared successfully.
+
+The staging directory is then renamed to the final backup directory on the same filesystem.
+
+This means that the presence of:
+
+```text
+full-YYYY-MM-DD-HH-MM/
+```
+
+indicates a backup that successfully passed the script's transfer and container-restart checks.
+
+If the backup fails before publication, the staging directory and incomplete metadata are removed automatically where safely possible.
+
+## Dry-Run Behavior
+
+Dry-run mode is enabled using:
+
+```bash
+-n
+```
+
+A dry-run performs a **no-disruption validation**.
+
+It:
+
+- connects to the target host,
+- discovers running Docker containers,
+- discovers persistent Docker storage,
+- optionally discovers Portainer-managed compose files,
+- validates the selected source paths,
+- executes the rsync-based capacity estimation,
+- verifies available disk space,
+- verifies available inodes.
+
+A dry-run does **not**:
+
+- stop containers,
+- start containers,
+- copy the actual backup data,
+- publish a `full-*` backup generation,
+- remove old backup generations.
+
+Example:
+
+```bash
+BACKUP_AUTO_PRUNE=0 \
+backup-script.sh \
+  -n \
+  -x pihole \
+  -P /home/myuser/portainer/docker-compose.yml \
+  backupuser \
+  remote.example.com \
+  /backups
+```
+
+A successful dry-run ends with:
+
+```text
+Dry run complete: sources and capacity checked; no backup was published.
+```
+
+## Retention
+
+The normal retention policy keeps the **4 most recent published backup generations**.
+
+After a successful backup, older generations are removed as required.
+
+Associated metadata is removed together with the corresponding generation:
+
+```text
+full-YYYY-MM-DD-HH-MM/
+logs/bklog_YYYY-MM-DD-HH-MM.log
+manifest_YYYY-MM-DD-HH-MM.tsv
+source_list_YYYY-MM-DD-HH-MM.lst
+```
+
+Storage-driven pre-pruning and normal retention serve different purposes:
+
+- **Pre-pruning** creates enough space to safely start the next backup.
+- **Normal retention** limits the number of published generations after a successful backup.
 
 ## Script-Specific Options
 
 | Option | Description |
-|--------|-------------|
-| `-s`   | Deprecated/no-op. Kept only for backward compatibility. |
-| `-P file` | Absolute path to Portainer's own `docker-compose.yml` on the target host. When set, the script also discovers additional compose files stored inside Portainer's data area and backs them up with full absolute paths. |
+|---|---|
+| `-s` | Deprecated/no-op. Kept only for backward compatibility. |
+| `-P file` | Absolute path to Portainer's own `docker-compose.yml` on the target host. Also discovers compose files stored inside Portainer's data area. |
+| `-n` | Safe dry-run. Performs discovery and capacity validation without stopping containers, copying data, pruning backups, or publishing a backup. |
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `BACKUP_MOUNTPOINT` | `/mnt/sdb` | Expected local filesystem mount containing the backup root. |
+| `BACKUP_AUTO_PRUNE` | `1` | Set to `0` to prevent automatic pre-pruning when available capacity is insufficient. |
 
 ## Portainer Environments Backup
 
 When `-P` is supplied:
 
 1. The specified Portainer `docker-compose.yml` is added to the backup set.
-2. The script detects the Portainer container on the target.
+2. The script detects a running Portainer container on the target.
 3. It resolves the host path mounted to `/data` inside that Portainer container.
 4. It searches that Portainer data path for additional compose files such as:
    - `docker-compose.yml`
@@ -143,57 +346,88 @@ When `-P` is supplied:
 
 This is intended for setups where Portainer stores stack definitions inside its own data area.
 
+If `-P` is explicitly requested but the script cannot identify a running Portainer container with a `/data` mount, the backup fails instead of silently omitting the requested Portainer configuration.
+
 ## Output Structure
 
-Backups are stored under:
+Successfully published backups are stored under:
 
-```bash
+```text
 <backup_root>/<target_host>/
 ```
 
-Each run creates:
+A successful real backup creates:
 
-- a backup directory:
+```text
+<backup_root>/<target_host>/
+├── full-YYYY-MM-DD-HH-MM/
+├── logs/
+│   └── bklog_YYYY-MM-DD-HH-MM.log
+├── manifest_YYYY-MM-DD-HH-MM.tsv
+└── source_list_YYYY-MM-DD-HH-MM.lst
+```
 
-  ```bash
-  full-YYYY-MM-DD-HH-MM/
-  ```
+Temporary staging directories use:
 
-- a log file:
+```text
+.backup-work-<timestamp>.<random>/
+```
 
-  ```bash
-  logs/bklog_YYYY-MM-DD-HH-MM.log
-  ```
-
-- a manifest file:
-
-  ```bash
-  manifest_YYYY-MM-DD-HH-MM.tsv
-  ```
-
-- a source list file:
-
-  ```bash
-  source_list_YYYY-MM-DD-HH-MM.lst
-  ```
+and are not considered valid restore points.
 
 ### Manifest file
 
 The manifest records what the script discovered during inspection, including:
 
 - container name
-- container state (for example `would-stop-for-backup` or `live-excluded` in dry-run mode)
-- storage kind (`bind`, `volume`, `compose-file`, etc.)
+- container state
+- storage kind
 - host-side path
 - optional notes
 
+Example container states include:
+
+```text
+stopped-for-backup
+would-stop-for-backup
+live-excluded
+config
+```
+
+Storage kinds may include:
+
+```text
+bind
+volume
+compose-file
+extra
+```
+
 ### Source list file
 
-The source list contains the final set of validated host paths that were actually selected for backup.
+The source list contains the final set of validated absolute host paths selected for the backup.
+
+The source list can later be used by `restore-script.sh` to determine which paths belong to a backup generation.
+
+## Container Recovery
+
+For real backup runs, the script records containers that need to be restarted.
+
+Container stop intent is recorded before the remote stop command is issued. This reduces the risk of losing track of a container if the SSH connection fails immediately after Docker successfully stops it.
+
+After the backup transfer, stopped containers are restarted.
+
+The script also verifies the resulting Docker running state.
+
+If one or more containers cannot be restarted:
+
+- the backup run fails,
+- the backup is not published as a successful `full-*` generation,
+- the recovery list is retained for troubleshooting.
 
 ## Examples
 
-### Back up only automatically discovered Docker storage
+### Back up automatically discovered Docker storage
 
 ```bash
 backup-script.sh backupuser remote.example.com /backups
@@ -202,34 +436,80 @@ backup-script.sh backupuser remote.example.com /backups
 ### Back up Docker storage but keep `pihole` running
 
 ```bash
-backup-script.sh -x pihole backupuser remote.example.com /backups
+backup-script.sh \
+  -x pihole \
+  backupuser \
+  remote.example.com \
+  /backups
 ```
 
 ### Back up Docker storage plus additional absolute paths
 
 ```bash
-backup-script.sh -x pihole backupuser remote.example.com /backups /etc /home/myuser/portainer
+backup-script.sh \
+  -x pihole \
+  backupuser \
+  remote.example.com \
+  /backups \
+  /etc \
+  /home/myuser/portainer
 ```
 
 ### Dry-run without disrupting running containers
 
 ```bash
-backup-script.sh -n -x pihole backupuser remote.example.com /backups /etc
+backup-script.sh \
+  -n \
+  -x pihole \
+  backupuser \
+  remote.example.com \
+  /backups \
+  /etc
 ```
 
 ### Back up Portainer compose files too
 
 ```bash
-backup-script.sh -P /home/myuser/portainer/docker-compose.yml backupuser remote.example.com /backups
+backup-script.sh \
+  -P /home/myuser/portainer/docker-compose.yml \
+  backupuser \
+  remote.example.com \
+  /backups
 ```
 
-### Dry-run with Portainer compose file discovery
+### Dry-run with Portainer compose discovery and no automatic pruning
 
 ```bash
-backup-script.sh -n -x pihole -P /home/myuser/portainer/docker-compose.yml backupuser remote.example.com /backups
+BACKUP_AUTO_PRUNE=0 \
+backup-script.sh \
+  -n \
+  -x pihole \
+  -P /home/myuser/portainer/docker-compose.yml \
+  backupuser \
+  remote.example.com \
+  /backups
 ```
 
----
+## Exit Behavior
+
+The script exits with a non-zero status when a material backup condition fails, including:
+
+- SSH preflight failure
+- remote Docker or rsync failure
+- missing or inaccessible source paths
+- missing expected backup filesystem
+- insufficient backup capacity
+- rsync transfer failure
+- container restart failure
+- unsafe or unexpected filesystem state
+
+A successful real run exits with:
+
+```text
+0
+```
+
+only after the backup has been successfully published.
 
 # `restore-script.sh`
 
